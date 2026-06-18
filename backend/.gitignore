@@ -1,0 +1,10 @@
+.venv/
+.uv-cache/
+.pycache-check/
+__pycache__/
+*.py[cod]
+*.log
+
+data/
+storage/
+.env
