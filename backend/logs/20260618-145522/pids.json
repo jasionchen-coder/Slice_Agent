@@ -1,5 +1,0 @@
-{
-  "redis": "already-running",
-  "celery": "already-running",
-  "api": "already-running"
-}

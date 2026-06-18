@@ -1,0 +1,38 @@
+# Local agent/tooling state
+.agents/
+.codex/
+skills-lock.json
+
+# Runtime files
+tmp/
+dump.rdb
+*.log
+logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Environments and secrets
+.env
+.env.*
+!.env.example
+!.env.local.example
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Nested repository metadata backup
+.git.bak_for_parent_push/
