@@ -1,3 +1,5 @@
+import json
+
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 
 from app.repositories.clip_repository import ClipRepository
@@ -66,6 +68,74 @@ async def create_task(
         task_id=task["task_id"],
         status=task["status"],
         message="任务创建成功",
+    )
+
+
+@router.post("/tasks/audio", response_model=TaskCreateResponse, status_code=status.HTTP_201_CREATED)
+async def create_audio_task(
+    audio_files: list[UploadFile] = File(...),
+    audio_manifest: str = Form(...),
+    original_video_name: str = Form(...),
+    video_duration: float = Form(...),
+    content_type: str = Form(...),
+    min_clip_duration: int = Form(30),
+    max_clip_duration: int = Form(180),
+    max_clip_count: int = Form(10),
+    risk_filter_enabled: bool = Form(True),
+) -> TaskCreateResponse:
+    if min_clip_duration >= max_clip_duration:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="min_clip_duration must be less than max_clip_duration.",
+        )
+
+    try:
+        manifest = json.loads(audio_manifest)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="audio_manifest must be valid JSON.",
+        ) from exc
+    if not isinstance(manifest, list):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="audio_manifest must be a JSON array.",
+        )
+    for index, item in enumerate(manifest):
+        if not isinstance(item, dict) or "start_time" not in item or "end_time" not in item:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"audio_manifest item {index} must include start_time and end_time.",
+            )
+        if float(item["start_time"]) >= float(item["end_time"]):
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"audio_manifest item {index} has invalid time range.",
+            )
+
+    service = TaskService()
+    try:
+        task = await service.create_from_audio_upload(
+            audio_files,
+            original_video_name=original_video_name,
+            video_duration=video_duration,
+            audio_manifest=manifest,
+            content_type=content_type,
+            min_clip_duration=min_clip_duration,
+            max_clip_duration=max_clip_duration,
+            max_clip_count=max_clip_count,
+            risk_filter_enabled=risk_filter_enabled,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+    if service.should_auto_process():
+        QueueService().submit(process_video_task, task["task_id"])
+
+    return TaskCreateResponse(
+        task_id=task["task_id"],
+        status=task["status"],
+        message="音频任务创建成功",
     )
 
 

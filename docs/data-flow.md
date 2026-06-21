@@ -1,45 +1,45 @@
 # 直播切片 Agent 数据流转说明
 
-本文档基于当前代码实现梳理项目的数据流转，覆盖前端页面、后端 API、Celery 异步任务、PostgreSQL 数据库、本地文件存储、Groq ASR、LLM 和 FFmpeg 的协作关系。
+本文档基于当前代码实现梳理项目的数据流转。当前默认方案已经调整为“视频留在浏览器本地，前端用 ffmpeg.wasm 提取 MP3，后端只接收音频做 ASR/LLM 分析，前端再用原视频本地切片”。旧的视频直传后端接口仍保留，用作兼容路径。
 
 ## 1. 总体架构
 
 ```text
 用户浏览器
   |
-  | 1. 上传视频 / 查看任务 / 审核切片
+  | 1. 选择视频，本地提取 MP3 / 查看任务 / 本地切片
   v
 Next.js 前端
   |
-  | HTTP API
+  | 2. 上传 MP3 或 MP3 分片
   v
 FastAPI 后端
   |
-  | 写任务记录、文件落盘、投递异步任务
+  | 3. 写任务记录、保存音频、投递异步任务
   v
 PostgreSQL + 本地 storage + Redis
   |
   | Celery worker 消费任务
   v
-ASR / LLM / FFmpeg Pipeline
+ASR / LLM Pipeline
   |
-  | 写文字稿、话题、切片记录、成片文件、日志
+  | 4. 写文字稿、话题、切片时间方案、日志
   v
-前端轮询任务状态并展示结果
+前端轮询任务状态，使用本地原视频切 mp4，按需上传保存
 ```
 
 核心角色：
 
-- 前端：负责上传视频、展示任务进度、展示日志、预览和编辑切片。
+- 前端：负责本地提取 MP3、本地切 mp4、展示任务进度、展示日志、预览和编辑切片。
 - FastAPI：负责接收请求、创建任务、查询任务、切片变更和下载。
 - Redis：作为 Celery broker/result backend。
-- Celery worker：执行耗时的视频处理 pipeline。
+- Celery worker：执行耗时的 ASR/LLM 分析 pipeline。
 - PostgreSQL：保存任务、文字稿、话题分析、切片和日志等结构化数据。
-- 本地 storage：保存原视频、音频、ASR/LLM JSON 中间产物和最终切片视频。
+- 本地 storage：保存前端上传的音频、ASR/LLM JSON 中间产物，以及用户按需上传保存的最终切片视频。
 
 ## 2. 前端到后端的入口流
 
-### 2.1 创建任务
+### 2.1 默认流程：前端提取 MP3 后创建音频任务
 
 用户在前端 `/tasks/create` 页面选择视频文件并填写参数：
 
@@ -49,7 +49,55 @@ ASR / LLM / FFmpeg Pipeline
 - `max_clip_count`
 - `risk_filter_enabled`
 
+浏览器端处理：
+
+1. 使用 HTML video metadata 读取原视频时长。
+2. 使用 `@ffmpeg/ffmpeg` 在浏览器内加载 ffmpeg.wasm。
+3. 对 30 分钟以内的视频提取单个 MP3。
+4. 对 30 分钟以上的视频按 30 分钟切成多个 MP3 分片。
+5. 构造 `audio_manifest`，记录每个 MP3 分片的 `chunk_index`、`start_time`、`end_time`。
+
 前端调用：
+
+```text
+POST /api/tasks/audio
+Content-Type: multipart/form-data
+```
+
+表单字段：
+
+```text
+audio_files[]          MP3 文件或多个 MP3 分片
+audio_manifest         JSON 数组，记录每段音频的起止时间
+original_video_name    原视频文件名
+video_duration         原视频时长
+content_type
+min_clip_duration
+max_clip_duration
+max_clip_count
+risk_filter_enabled
+```
+
+对应代码：
+
+- 前端表单：[frontend/src/components/tasks/task-create-form.tsx](../frontend/src/components/tasks/task-create-form.tsx)
+- 浏览器 FFmpeg 工具：[frontend/src/lib/browser-ffmpeg.ts](../frontend/src/lib/browser-ffmpeg.ts)
+- API client：[frontend/src/lib/api.ts](../frontend/src/lib/api.ts)
+- 后端路由：[backend/app/api/routes/tasks.py](../backend/app/api/routes/tasks.py)
+
+后端处理步骤：
+
+1. 校验 `audio_manifest`。
+2. 校验 MP3/音频文件格式。
+3. 保存音频到 `storage/live-slicing/tasks/{task_id}/audio/chunks/`。
+4. 写入 `audio/manifest.json`。
+5. 在 `tasks` 表创建任务记录，`video_url = frontend-audio`。
+6. 如果 `APP_AUTO_PROCESS=true`，投递 Celery 任务 `process_video_task(task_id)`。
+7. 返回 `task_id` 给前端。
+
+### 2.2 兼容流程：直接上传视频创建任务
+
+旧的视频直传接口仍保留：
 
 ```text
 POST /api/tasks
@@ -62,7 +110,9 @@ Content-Type: multipart/form-data
 - API client：[frontend/src/lib/api.ts](../frontend/src/lib/api.ts)
 - 后端路由：[backend/app/api/routes/tasks.py](../backend/app/api/routes/tasks.py)
 
-后端处理步骤：
+该流程会把原视频上传后端，后端使用 FFprobe 读取视频信息，使用 FFmpeg 提取音频和切 mp4。新默认流程不再推荐这个路径，除非明确希望服务器端保存原视频并负责最终切片。
+
+后端兼容处理步骤：
 
 1. 校验必须上传本地视频文件。
 2. 校验 `min_clip_duration < max_clip_duration`。
@@ -85,13 +135,11 @@ backend/storage/live-slicing/tasks/{task_id}/
 
 ```text
 storage/live-slicing/tasks/{task_id}/
-  original/
-    source.mp4
   audio/
-    audio.wav
+    manifest.json
     chunks/
-      chunk_000.wav
-      chunk_001.wav
+      audio_001.mp3
+      audio_002.mp3
   transcript/
     raw_transcript.json
     cleaned_transcript.json
@@ -108,14 +156,22 @@ storage/live-slicing/tasks/{task_id}/
 
 文件用途：
 
-- `original/source.*`：用户上传的原始视频。
-- `audio/audio.wav`：从视频中提取出的完整音频。
-- `audio/chunks/`：长音频切分后的 ASR 分片。
+- `audio/manifest.json`：前端上传音频分片的起止时间信息。
+- `audio/chunks/`：前端提取并上传的 MP3 音频或音频分片。
 - `transcript/raw_transcript.json`：ASR 原始转写结果。
 - `transcript/cleaned_transcript.json`：清洗后的文字稿。
 - `llm/topic_analysis.json`：LLM 话题分析结果。
 - `llm/clip_plan.json`：LLM 生成的切片方案。
-- `clips/*.mp4`：FFmpeg 输出的最终切片视频。
+- `clips/*.mp4`：用户在前端本地切出 mp4 后，按需上传保存的最终切片视频。
+
+兼容视频直传路径还会出现：
+
+```text
+original/source.*
+audio/audio.wav
+```
+
+其中 `original/source.*` 是后端保存的原视频，`audio/audio.wav` 是服务器端 FFmpeg 提取的音频。
 
 ## 4. 数据库表流转
 
@@ -255,15 +311,13 @@ VideoPipeline.process(task_id)
 
 ### 5.1 `extracting_audio`
 
-状态更新：
+默认音频任务中，前端已经完成 MP3 提取，后端不会再执行服务器端 FFmpeg 提取音频。pipeline 会读取 `audio/manifest.json`，把前端上传的 MP3 分片转换成内部 `AudioChunk` 列表，并记录日志：
 
 ```text
-status = extracting_audio
-progress = 15
-current_stage = 音频提取中
+使用前端上传音频，共 N 段
 ```
 
-处理：
+兼容视频直传任务中，该阶段仍会执行服务器端音频提取：
 
 1. 读取 `tasks.original_video_path`。
 2. 调用 FFmpeg 提取音频。
@@ -351,9 +405,23 @@ current_stage = 切片方案生成中
    - 标题和摘要存在
    - 分数在 0-100
    - 开启风险过滤时过滤高风险切片
-6. 将合法候选写入 `clips` 表，初始状态为 `pending`。
+6. 将合法候选写入 `clips` 表。
+7. 默认音频任务会把切片状态更新为 `ready_for_local_cut`，表示后端只生成切片时间方案，等待前端本地切 mp4。
+8. 兼容视频直传任务保持 `pending`，继续进入服务器端 `cutting_video`。
 
 ### 5.6 `cutting_video`
+
+默认音频任务不会进入该阶段，因为后端没有原视频文件。生成切片时间方案后，任务直接进入：
+
+```text
+status = completed
+progress = 100
+current_stage = 切片方案已生成
+```
+
+前端在切片审核页重新选择本地原视频，按 `clips.start_time` 和 `clips.end_time` 使用浏览器 FFmpeg 切出 mp4。
+
+兼容视频直传任务才会执行服务器端 `cutting_video`：
 
 状态更新：
 
@@ -519,23 +587,24 @@ POST /api/tasks/{task_id}/retry
 GET /api/tasks/{task_id}/clips
 PATCH /api/clips/{clip_id}
 POST /api/clips/{clip_id}/regenerate
+POST /api/clips/{clip_id}/upload
 GET /api/clips/{clip_id}/download
 ```
 
 展示和操作：
 
 - 候选切片列表
-- 切片视频预览
+- 本地切片视频预览
 - 标题、摘要、起止时间编辑
-- 重新生成切片
-- 下载切片文件
+- 选择本地原视频后按时间点切当前或全部切片
+- 下载本地切片文件
+- 按需上传本地切片到后端保存
 
 如果用户修改 `start_time` 或 `end_time`：
 
 1. 后端更新 `clips` 表。
-2. 设置 `status = pending`。
-3. 投递 `regenerate_clip_task(clip_id)`。
-4. Celery 重新调用 FFmpeg 切割该切片。
+2. 默认音频任务设置 `status = ready_for_local_cut`，等待前端重新本地切片。
+3. 兼容视频直传任务设置 `status = pending` 并投递 `regenerate_clip_task(clip_id)`，由服务器端 FFmpeg 重新切割。
 
 ## 8. 切片重新生成流
 
@@ -553,8 +622,19 @@ POST /api/clips/{clip_id}/regenerate
 
 处理：
 
+默认音频任务：
+
 1. 查询 `clips` 表获得切片信息。
-2. 查询关联 `tasks` 表获得原视频路径。
+2. 查询关联 `tasks` 表，识别 `video_url = frontend-audio`。
+3. 将切片状态改为 `ready_for_local_cut`。
+4. 前端重新选择本地原视频并用浏览器 FFmpeg 切片。
+5. 用户按需调用 `POST /api/clips/{clip_id}/upload` 上传保存最终 mp4。
+6. 后端更新 `clip_path`、`clip_url` 和 `status = success`。
+
+兼容视频直传任务：
+
+1. 查询 `clips` 表获得切片信息。
+2. 查询关联 `tasks` 表获得后端原视频路径。
 3. 将切片状态改为 `pending`。
 4. Celery 执行 `regenerate_clip_task`。
 5. 调用 `ClipService.regenerate_clip()`。
@@ -565,10 +645,10 @@ POST /api/clips/{clip_id}/regenerate
 
 pipeline 对关键外部调用使用 `run_with_retries()`：
 
-- 音频提取
+- 音频提取，兼容视频直传任务
 - ASR
 - LLM
-- FFmpeg 切片
+- FFmpeg 切片，兼容视频直传任务
 
 重试时会写入 `task_logs`：
 
@@ -637,7 +717,42 @@ http://127.0.0.1:8000
 ## 11. 一次完整任务的数据写入顺序
 
 ```text
-1. 用户上传视频
+1. 用户在前端选择视频
+2. 浏览器 ffmpeg.wasm 提取 MP3
+3. 如果视频超过 30 分钟，浏览器按 30 分钟切出多个 MP3
+4. 前端上传 MP3 和 audio_manifest
+5. storage 写 audio/chunks/*.mp3 和 audio/manifest.json
+6. tasks 插入任务记录，status=uploaded，video_url=frontend-audio
+7. Redis 收到 Celery task_id
+8. Celery worker 开始 process_video_task
+9. pipeline 读取 audio_manifest，跳过服务器端音频提取
+10. tasks 更新 transcribing
+11. ASR 返回 segments
+12. storage 写 transcript/raw_transcript.json
+13. tasks 更新 cleaning_transcript
+14. storage 写 transcript/cleaned_transcript.json
+15. transcripts 插入文字稿主记录
+16. transcript_segments 批量插入文字稿片段
+17. tasks 更新 analyzing_content
+18. LLM 返回 topics
+19. storage 写 llm/topic_analysis.json
+20. topic_analysis 批量插入话题分析
+21. tasks 更新 generating_clips
+22. LLM 返回 clip candidates
+23. storage 写 llm/clip_plan.json
+24. clips 插入候选切片并标记 ready_for_local_cut
+25. tasks 更新 completed
+26. 前端读取 clips
+27. 用户在切片页重新选择原视频
+28. 前端浏览器 FFmpeg 按 start_time/end_time 切出 mp4
+29. 用户下载本地切片，或上传保存到后端
+30. 后端保存 clips/{clip_id}.mp4 并更新 clip_url
+```
+
+兼容视频直传任务的数据写入顺序：
+
+```text
+1. 用户上传视频到后端
 2. storage 写 original/source.*
 3. tasks 插入任务记录，status=uploaded
 4. Redis 收到 Celery task_id
@@ -670,19 +785,24 @@ http://127.0.0.1:8000
 
 当前代码已经具备：
 
-- 本地视频上传。
+- 浏览器端 ffmpeg.wasm 提取 MP3。
+- 超过 30 分钟的视频按 30 分钟提取多个 MP3 分片上传。
+- 后端音频任务接口 `POST /api/tasks/audio`。
+- 后端基于前端上传音频直接 ASR/LLM 分析。
+- 前端基于后端返回的切片时间点，用本地原视频切出 mp4。
+- 本地切片下载和按需上传保存。
+- 兼容旧的视频直传后端流程。
 - PostgreSQL 持久化。
 - Redis + Celery 异步任务。
 - 长音频切分和 ASR 分片合并。
 - ASR/LLM/FFmpeg 重试和日志记录。
 - LLM 结构化结果校验。
-- FFmpeg 切片。
 - 前端任务创建、进度查看、日志查看、切片审核、下载。
 
 当前仍属于后续增强的点：
 
 - 视频 URL 导入目前接口会提示 P1 后续支持。
-- 原视频在线预览接口尚未单独暴露。
 - 多用户/权限体系尚未接入。
 - 对象存储 MinIO/S3 尚未接入，目前使用本地文件系统。
 - 更细粒度的 Celery worker 生命周期管理可以继续增强。
+- 浏览器 ffmpeg.wasm 首次加载需要下载 wasm 资源，首次处理会比较慢。

@@ -1,4 +1,5 @@
 from pathlib import Path
+import mimetypes
 
 import httpx
 
@@ -55,7 +56,8 @@ class GroqASRClient(ASRClient):
         }
         try:
             with audio_path.open("rb") as audio_file:
-                files = {"file": (audio_path.name, audio_file, "audio/wav")}
+                mime_type = mimetypes.guess_type(audio_path.name)[0] or "audio/mpeg"
+                files = {"file": (audio_path.name, audio_file, mime_type)}
                 response = httpx.post(
                     url,
                     headers=headers,

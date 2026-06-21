@@ -34,3 +34,14 @@ export function ClipRiskBadge({ riskLevel }: { riskLevel: Clip["risk_level"] }) 
   if (riskLevel === "high") return <Badge tone="destructive">高风险</Badge>;
   return <Badge tone="outline">{riskLevel}</Badge>;
 }
+
+export function clipStatusLabel(status?: string | null) {
+  const labels: Record<string, string> = {
+    pending: "待处理",
+    ready_for_local_cut: "待本地切片",
+    cutting_video: "切片中",
+    success: "已保存",
+    failed: "失败"
+  };
+  return status ? labels[status] || status : "";
+}

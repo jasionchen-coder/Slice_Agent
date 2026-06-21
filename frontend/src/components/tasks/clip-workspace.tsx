@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
-import { DownloadIcon, RefreshCwIcon, RotateCcwIcon, SaveIcon } from "lucide-react";
+import { DownloadIcon, RefreshCwIcon, RotateCcwIcon, SaveIcon, ScissorsIcon, UploadCloudIcon } from "lucide-react";
 import { Alert } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -10,8 +10,9 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
-import { ClipRiskBadge } from "@/components/tasks/status-badge";
-import { clipDownloadUrl, getTaskClips, regenerateClip, updateClip } from "@/lib/api";
+import { ClipRiskBadge, clipStatusLabel } from "@/components/tasks/status-badge";
+import { clipDownloadUrl, getTaskClips, regenerateClip, updateClip, uploadClipFile } from "@/lib/api";
+import { cutLocalClip, type LocalCutResult } from "@/lib/browser-ffmpeg";
 import type { Clip } from "@/lib/types";
 import { absoluteMediaUrl, cn, formatSeconds } from "@/lib/utils";
 
@@ -25,8 +26,13 @@ export function ClipWorkspace({ taskId }: { taskId: string }) {
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [originalVideo, setOriginalVideo] = useState<File | null>(null);
+  const [localCuts, setLocalCuts] = useState<Record<string, LocalCutResult>>({});
+  const [localStatus, setLocalStatus] = useState("");
+  const localCutsRef = useRef<Record<string, LocalCutResult>>({});
 
   const activeClip = useMemo(() => clips.find((clip) => clip.clip_id === activeId) || clips[0], [clips, activeId]);
+  const activeLocalCut = activeClip ? localCuts[activeClip.clip_id] : null;
 
   async function load() {
     setLoading(true);
@@ -45,6 +51,12 @@ export function ClipWorkspace({ taskId }: { taskId: string }) {
   useEffect(() => {
     load();
   }, [taskId]);
+
+  useEffect(() => {
+    return () => {
+      Object.values(localCutsRef.current).forEach((cut) => URL.revokeObjectURL(cut.url));
+    };
+  }, []);
 
   useEffect(() => {
     if (!activeClip) return;
@@ -90,6 +102,68 @@ export function ClipWorkspace({ taskId }: { taskId: string }) {
     }
   }
 
+  async function cutActiveClip() {
+    if (!activeClip || !originalVideo) return;
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      const result = await cutLocalClip(originalVideo, activeClip, setLocalStatus);
+      replaceLocalCut(result);
+      setMessage("本地切片已生成。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "本地切片失败");
+    } finally {
+      setLocalStatus("");
+      setSaving(false);
+    }
+  }
+
+  async function cutAllClips() {
+    if (!originalVideo || clips.length === 0) return;
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      for (const clip of clips) {
+        const result = await cutLocalClip(originalVideo, clip, setLocalStatus);
+        replaceLocalCut(result);
+      }
+      setMessage("全部本地切片已生成。");
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "批量本地切片失败");
+    } finally {
+      setLocalStatus("");
+      setSaving(false);
+    }
+  }
+
+  async function uploadActiveLocalCut() {
+    if (!activeClip || !activeLocalCut) return;
+    setSaving(true);
+    setError("");
+    setMessage("");
+    try {
+      await uploadClipFile(activeClip.clip_id, activeLocalCut.file);
+      setMessage("本地切片已上传保存。");
+      await load();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "上传切片失败");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function replaceLocalCut(result: LocalCutResult) {
+    setLocalCuts((current) => {
+      const previous = current[result.clipId];
+      if (previous) URL.revokeObjectURL(previous.url);
+      const next = { ...current, [result.clipId]: result };
+      localCutsRef.current = next;
+      return next;
+    });
+  }
+
   return (
     <div className="grid gap-4 lg:grid-cols-[360px_minmax(0,1fr)]">
       <Card>
@@ -121,7 +195,7 @@ export function ClipWorkspace({ taskId }: { taskId: string }) {
                 <div className="mt-2 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
                   <span>{formatSeconds(clip.start_time)}-{formatSeconds(clip.end_time)}</span>
                   <ClipRiskBadge riskLevel={clip.risk_level} />
-                  {clip.status ? <Badge tone="secondary">{clip.status}</Badge> : null}
+                  {clip.status ? <Badge tone="secondary">{clipStatusLabel(clip.status)}</Badge> : null}
                 </div>
               </button>
             ))
@@ -138,11 +212,36 @@ export function ClipWorkspace({ taskId }: { taskId: string }) {
           <CardContent className="space-y-4">
             {error ? <Alert tone="destructive">{error}</Alert> : null}
             {message ? <Alert>{message}</Alert> : null}
-            {activeClip?.clip_url ? (
+            <div className="grid gap-3 rounded-md border p-3">
+              <div className="grid gap-2">
+                <Label htmlFor="local-video">本地原视频</Label>
+                <Input
+                  id="local-video"
+                  type="file"
+                  accept="video/*"
+                  onChange={(event) => setOriginalVideo(event.target.files?.[0] || null)}
+                />
+                <p className="text-xs text-muted-foreground">后端只保存 MP3 和切片时间点；这里选择原视频后在浏览器本地切出 mp4。</p>
+              </div>
+              {localStatus ? <Alert>{localStatus}</Alert> : null}
+              <div className="flex flex-wrap justify-end gap-2">
+                <Button variant="outline" onClick={cutActiveClip} disabled={!activeClip || !originalVideo || saving}>
+                  <ScissorsIcon data-icon="inline-start" />
+                  本地切当前
+                </Button>
+                <Button variant="outline" onClick={cutAllClips} disabled={!originalVideo || clips.length === 0 || saving}>
+                  <ScissorsIcon data-icon="inline-start" />
+                  本地切全部
+                </Button>
+              </div>
+            </div>
+            {activeLocalCut ? (
+              <video className="aspect-video w-full rounded-md" src={activeLocalCut.url} controls />
+            ) : activeClip?.clip_url ? (
               <video className="aspect-video w-full rounded-md" src={absoluteMediaUrl(activeClip.clip_url)} controls />
             ) : (
               <div className="flex aspect-video items-center justify-center rounded-md border bg-secondary text-sm text-muted-foreground">
-                当前切片还没有可预览的视频文件。
+                当前切片还没有可预览的视频文件，请选择本地原视频后切片。
               </div>
             )}
             {activeClip ? (
@@ -178,14 +277,34 @@ export function ClipWorkspace({ taskId }: { taskId: string }) {
             <div className="flex flex-wrap justify-end gap-2">
               <Button variant="outline" onClick={regenerate} disabled={!activeClip || saving}>
                 <RotateCcwIcon data-icon="inline-start" />
-                重新生成
+                重置切片
               </Button>
+              {activeLocalCut ? (
+                <>
+                  <Link
+                    href={activeLocalCut.url}
+                    download={activeLocalCut.file.name}
+                    className={cn(
+                      "inline-flex h-10 items-center justify-center gap-2 rounded-md border bg-background px-4 py-2 text-sm font-medium hover:bg-secondary",
+                      saving && "pointer-events-none opacity-50",
+                      "[&_svg]:h-4 [&_svg]:w-4"
+                    )}
+                  >
+                    <DownloadIcon data-icon="inline-start" />
+                    下载本地切片
+                  </Link>
+                  <Button variant="outline" onClick={uploadActiveLocalCut} disabled={saving}>
+                    <UploadCloudIcon data-icon="inline-start" />
+                    上传保存
+                  </Button>
+                </>
+              ) : null}
               {activeClip ? (
                 <Link
                   href={clipDownloadUrl(activeClip.clip_id)}
                   className={cn(
                     "inline-flex h-10 items-center justify-center gap-2 rounded-md border bg-background px-4 py-2 text-sm font-medium hover:bg-secondary",
-                    saving && "pointer-events-none opacity-50",
+                    (!activeClip.clip_url || saving) && "pointer-events-none opacity-50",
                     "[&_svg]:h-4 [&_svg]:w-4"
                   )}
                 >

@@ -17,6 +17,7 @@ class TaskStatus(StrEnum):
 
 class ClipStatus(StrEnum):
     PENDING = "pending"
+    READY_FOR_LOCAL_CUT = "ready_for_local_cut"
     CUTTING_VIDEO = "cutting_video"
     SUCCESS = "success"
     FAILED = "failed"
@@ -26,4 +27,3 @@ class RiskLevel(StrEnum):
     LOW = "low"
     MEDIUM = "medium"
     HIGH = "high"
-

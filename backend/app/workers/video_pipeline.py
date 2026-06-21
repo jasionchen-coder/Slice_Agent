@@ -3,12 +3,12 @@ from pathlib import Path
 from app.core.config import settings
 from app.integrations.asr_client import get_asr_client
 from app.integrations.llm_client import get_llm_client
-from app.models.enums import TaskStatus
+from app.models.enums import ClipStatus, TaskStatus
 from app.repositories.clip_repository import ClipRepository
 from app.repositories.task_repository import TaskRepository
 from app.repositories.task_log_repository import TaskLogRepository
 from app.repositories.transcript_repository import TranscriptRepository
-from app.services.audio_service import AudioService
+from app.services.audio_service import AudioChunk, AudioService
 from app.services.clip_service import ClipService, VideoCutError
 from app.services.storage_service import StorageService
 from app.services.transcript_service import TranscriptService
@@ -40,27 +40,31 @@ class VideoPipeline:
             task = self._get_task(task_id)
             self._ensure_not_cancelled(task_id)
 
-            stage = TaskStatus.EXTRACTING_AUDIO
-            self._log(task_id, str(stage), "info", "开始提取音频")
-            self.task_repository.update_status(
-                task_id, status=TaskStatus.EXTRACTING_AUDIO, progress=15, current_stage="音频提取中"
-            )
-            audio_path = run_with_retries(
-                lambda: self.audio_service.extract_audio(
-                    Path(task["original_video_path"]),
-                    self.storage_service.audio_path(task_id),
-                ),
-                retries=settings.audio_extract_retries,
-                on_retry=lambda attempt, exc: self._log_retry(task_id, str(stage), attempt, exc),
-            )
-            chunks = self.audio_service.split_audio(
-                audio_path,
-                self.storage_service.audio_chunks_dir(task_id),
-                total_duration=float(task.get("video_duration") or 0),
-                chunk_seconds=settings.audio_chunk_seconds,
-                overlap_seconds=settings.audio_chunk_overlap_seconds,
-            )
-            self._log(task_id, str(stage), "info", f"音频分片完成，共 {len(chunks)} 段")
+            if self._is_frontend_audio_task(task):
+                chunks = self._frontend_audio_chunks(task_id)
+                self._log(task_id, str(TaskStatus.EXTRACTING_AUDIO), "info", f"使用前端上传音频，共 {len(chunks)} 段")
+            else:
+                stage = TaskStatus.EXTRACTING_AUDIO
+                self._log(task_id, str(stage), "info", "开始提取音频")
+                self.task_repository.update_status(
+                    task_id, status=TaskStatus.EXTRACTING_AUDIO, progress=15, current_stage="音频提取中"
+                )
+                audio_path = run_with_retries(
+                    lambda: self.audio_service.extract_audio(
+                        Path(task["original_video_path"]),
+                        self.storage_service.audio_path(task_id),
+                    ),
+                    retries=settings.audio_extract_retries,
+                    on_retry=lambda attempt, exc: self._log_retry(task_id, str(stage), attempt, exc),
+                )
+                chunks = self.audio_service.split_audio(
+                    audio_path,
+                    self.storage_service.audio_chunks_dir(task_id),
+                    total_duration=float(task.get("video_duration") or 0),
+                    chunk_seconds=settings.audio_chunk_seconds,
+                    overlap_seconds=settings.audio_chunk_overlap_seconds,
+                )
+                self._log(task_id, str(stage), "info", f"音频分片完成，共 {len(chunks)} 段")
 
             self._ensure_not_cancelled(task_id)
             stage = TaskStatus.TRANSCRIBING
@@ -219,6 +223,18 @@ class VideoPipeline:
                 video_duration=float(task["video_duration"] or 0),
             )
 
+            if self._is_frontend_audio_task(task):
+                for clip in clips:
+                    self.clip_repository.update(clip["clip_id"], {"status": ClipStatus.READY_FOR_LOCAL_CUT})
+                self._log(task_id, str(TaskStatus.COMPLETED), "info", "切片时间方案已生成，等待前端本地切片")
+                self.task_repository.update_status(
+                    task_id,
+                    status=TaskStatus.COMPLETED,
+                    progress=100,
+                    current_stage="切片方案已生成",
+                )
+                return
+
             self._ensure_not_cancelled(task_id)
             stage = TaskStatus.CUTTING_VIDEO
             self._log(task_id, str(stage), "info", "开始切割视频")
@@ -275,6 +291,26 @@ class VideoPipeline:
         task = self._get_task(task_id)
         if task["status"] == TaskStatus.CANCELLED:
             raise TaskCancelled(task_id)
+
+    def _is_frontend_audio_task(self, task: dict) -> bool:
+        return task.get("video_url") == "frontend-audio"
+
+    def _frontend_audio_chunks(self, task_id: str) -> list[AudioChunk]:
+        manifest = self.storage_service.load_audio_manifest(task_id)
+        chunks = [
+            AudioChunk(
+                path=Path(item["path"]),
+                start_time=float(item["start_time"]),
+                end_time=float(item["end_time"]),
+            )
+            for item in manifest
+        ]
+        if not chunks:
+            raise RuntimeError("Frontend audio task has no uploaded audio chunks")
+        for chunk in chunks:
+            if not chunk.path.exists():
+                raise RuntimeError(f"Uploaded audio chunk does not exist: {chunk.path}")
+        return chunks
 
     def _log(
         self,

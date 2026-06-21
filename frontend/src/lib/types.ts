@@ -47,7 +47,7 @@ export type Clip = {
   tags: string[];
   content_type?: string | null;
   clip_url?: string | null;
-  status?: string | null;
+  status?: "pending" | "ready_for_local_cut" | "cutting_video" | "success" | "failed" | string | null;
   error_message?: string | null;
   created_at: string;
   updated_at: string;
@@ -63,4 +63,3 @@ export type TaskLog = {
   error_message?: string | null;
   created_at: string;
 };
-

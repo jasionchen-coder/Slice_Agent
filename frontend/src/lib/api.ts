@@ -55,6 +55,18 @@ export async function createTask(formData: FormData) {
   return response.json() as Promise<{ task_id: string; status: string; message: string }>;
 }
 
+export async function createAudioTask(formData: FormData) {
+  const response = await fetch(`${apiBaseUrl()}/api/tasks/audio`, {
+    method: "POST",
+    body: formData
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || response.statusText);
+  }
+  return response.json() as Promise<{ task_id: string; status: string; message: string }>;
+}
+
 export function updateClip(clipId: string, payload: Partial<Pick<Clip, "title" | "summary" | "start_time" | "end_time">>) {
   return request<{ clip_id: string; status?: string; message: string }>(`/api/clips/${clipId}`, {
     method: "PATCH",
@@ -67,6 +79,20 @@ export function regenerateClip(clipId: string) {
   return request<{ clip_id: string; status?: string; message: string }>(`/api/clips/${clipId}/regenerate`, {
     method: "POST"
   });
+}
+
+export async function uploadClipFile(clipId: string, file: File) {
+  const formData = new FormData();
+  formData.append("file", file);
+  const response = await fetch(`${apiBaseUrl()}/api/clips/${clipId}/upload`, {
+    method: "POST",
+    body: formData
+  });
+  if (!response.ok) {
+    const body = await response.json().catch(() => null);
+    throw new Error(body?.detail || response.statusText);
+  }
+  return response.json() as Promise<{ clip_id: string; status?: string; message: string }>;
 }
 
 export function clipDownloadUrl(clipId: string) {
